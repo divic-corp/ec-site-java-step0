@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main, develop]
 
+# Superseded PR candidates may stop; independent manual/push runs keep their own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}-${{ github.event_name == 'pull_request' && 'latest' || github.run_attempt }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build & Test
