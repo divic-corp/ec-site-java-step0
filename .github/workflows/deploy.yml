@@ -17,13 +17,34 @@ jobs:
     name: Deploy to EC2
     runs-on: ubuntu-latest
     environment: production
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event_name == 'workflow_run' &&
+           github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'push' &&
+           github.event.workflow_run.head_branch == 'main' &&
+           github.event.workflow_run.head_repository.id == github.repository_id &&
+           github.event.workflow_run.head_repository.full_name == github.repository) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Select the trusted CI artifact
+        if: ${{ github.event_name == 'workflow_run' }}
+        id: producer
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const { selectArtifact } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-artifact.mjs`);
+            const selected = await selectArtifact({ github, context });
+            core.setOutput('selection', JSON.stringify(selected));
+            core.setOutput('artifact-id', String(selected.artifactId));
 
       - name: Set up JDK 21
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/setup-java@v5
         with:
           java-version: "21"
@@ -31,7 +52,32 @@ jobs:
           cache: maven
 
       - name: Package application
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: ./mvnw clean package -DskipTests --batch-mode --no-transfer-progress
+
+      - name: Download the exact verified JAR
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ steps.producer.outputs.artifact-id }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ci-deploy-artifact/
+          digest-mismatch: error
+
+      - name: Verify and stage the CI JAR
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CI_ARTIFACT_SELECTION: ${{ steps.producer.outputs.selection }}
+        with:
+          script: |
+            const { stageArtifact, currentProducer } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-artifact.mjs`);
+            const selected = JSON.parse(process.env.CI_ARTIFACT_SELECTION);
+            const staged = await stageArtifact({ selected });
+            await currentProducer({ github, context });
+            core.info(`Verified CI run ${selected.producer.runId}, attempt ${selected.producer.runAttempt}, commit ${selected.producer.headSha}; ${staged.file} ${staged.sha256}`);
 
       - name: Copy JAR to EC2
         uses: appleboy/scp-action@v1.0.0
